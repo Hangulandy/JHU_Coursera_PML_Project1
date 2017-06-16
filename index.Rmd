@@ -2,29 +2,260 @@
 title: "Practical Machine Learning Course Project"
 author: "hangulandy"
 date: "6/16/2017"
-output: html_document
+output: 
+        html_document:
+                fig_width: 8.5
+                fig_height: 6
+                toc: true
+                number_sections: true
+                toc_float:
+                        collapsed: true
+                        smooth_scroll: true
+                keep_md: true
 ---
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+```{r setup, include = TRUE, warning = FALSE, message = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, 
+                      cache = TRUE)
+
+## Load packages for this project
+library(caret)
+library(e1071)
+library(randomForest)
+library(rattle)
+library(rpart)
+library(gbm)
 ```
 
-## R Markdown
+# Executive Summary
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+This project attempts to use personal activity data to build a machine learning model that will classify how well individuals are performing exercises.  
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+The analysis compares six different models (five unique methods and a combined classifier), to determine the most accurate model.
 
-```{r cars}
-summary(cars)
+The combined classifier model has the highest accuracy at 99.92% with an estimated out of bag error rate of 0.16%.
+
+# Background
+
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement – a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. 
+
+One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. The goal of this project is to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website here:
+
+http://groupware.les.inf.puc-rio.br/har  (see the section on the Weight Lifting Exercise Dataset)
+
+# Data
+
+The training data for this project were downloaded from https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv on June 9, 2017.
+
+The test data for this project were downloaded from https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv on June 9, 2017.
+
+The data for this project come from this source: http://groupware.les.inf.puc-rio.br/har. 
+
+If you use the document you create for this class for any purpose please cite them as they have been very generous in allowing their data to be used for this kind of assignment.
+
+## Load the Data
+
+```{r}
+Dest <- c("pml-training.csv", 
+          "pml-testing.csv")
+
+URL <- c("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", 
+         "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv")
+
+
+## Downloads the data.
+dl_dat <- function() {
+        for (i in 1:length(URL)) {
+                download.file(URL[i], Dest[i], method = "curl")
+        }
+}
+
+## Load the complete training data set and testing data set (to be validation)
+dat1 <- read.csv(Dest[1], header = TRUE)
+dat2 <- read.csv(Dest[2], header = TRUE)
 ```
 
-## Including Plots
+## View and Trim the Data
 
-You can also embed plots, for example:
+To view the data: (not evaluated for brevity)
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+```{r eval = FALSE}
+str(dat1)
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+```{r}
+a <- apply(dat1, 2, is.na)
+b <- apply(a, 2, sum)
+c <- length(which(b == max(b)))
+```
+
+A quick look using `str(dat1)` shows that the data are large with `r dim(dat1)[1]` observations of `r dim(dat1)[2]` variables.  Additionally, there are many NA values.  `r c` columns have `r max(b)` NA values, so they should be removed.  There are also factor variables with no intelligible value, so these should be removed.  Identifying information should also be removed since it will not be considered in the model.
+
+```{r}
+## Function will remove variables that are not useful for the model
+## I could have used nearZeroVar(), but didn't.  In this case, it produces
+## the same result
+trim_dat <- function(dat) { 
+        
+        ## Check columns for NA values
+        a <- apply(dat, 2, is.na)
+        b <- apply(a, 2, sum)
+        
+        ## Check for and index variable columns that have no value
+        check <- function(x) {
+                x == ""
+        }
+        c <- apply(dat, 2, check)
+        d <- apply(c, 2, sum)
+
+        e <- intersect(which(b == 0), which(d == 0))
+        
+        dat <- dat[ , e] ## Subsets dat to only columns with sufficient data
+        dat <- dat[ , -c(1:6)] ## Removes identifying data
+        
+        return(dat)
+        
+}
+
+dat1 <- trim_dat(dat = dat1)
+dat2 <- trim_dat(dat = dat2)
+```
+
+## Slice the Data
+
+I will use a simple 3/4 split to divide into training and testing data.
+
+```{r}
+## Since there are enough data, I will slice to create training and test sets 
+## The training set will be to build the model
+## The test set will be used to estimate the out of sample error
+
+seed <- 23232
+
+set.seed(seed)
+inTrain <- createDataPartition(y = dat1$classe, p = 0.75, list = FALSE)
+training <- dat1[inTrain, ]
+testing <- dat1[-inTrain, ]
+```
+
+# Build and Compare Models
+
+First, I will define some universal variables for tuning the models.  The seed is already defined as `r seed`, so I will just refer to it before each model build.
+
+**Cross Validation:** I chose five folds for cross validation to balance between bias and variance.  All methods except for random forests use this number.  According to the author of the randomForest package, there is no need for cross validation in random forests.  See: https://www.stat.berkeley.edu/~breiman/RandomForests/cc_home.htm#ooberr.  Also, I used randomForest() instead of caret train() because it is faster.  Url Accessed on June 11, 2017.
+
+I chose 100 trees because of post at: https://stats.stackexchange.com/questions/36165/does-the-optimal-number-of-trees-in-a-random-forest-depend-on-the-number-of-pred.  Post says optimal number of trees is between 64 and 128.  Accessed on June 11, 2017
+
+```{r}
+cv <- 5 ## number of folds for cross validation
+nt <- 100 ## number of trees certain models
+ctl <- trainControl(method = "cv", 
+                    number = cv, 
+                    verboseIter = FALSE, 
+                    summaryFunction = multiClassSummary,
+                    classProbs = TRUE)
+```
+
+## Gradient Boosting
+
+Although the gbm() function is better at identifying a specific number of trees, the function output and predictions did not match the caret package train() output and predictions, so I chose to just use caret as I did not know what I was doing wrong with gbm().
+
+```{r}
+set.seed(seed)
+mod_gbm <- train(classe ~ ., 
+                 data = training, 
+                 method = "gbm", 
+                 trControl = ctl, 
+                 verbose = FALSE,
+                 preProc = c("center", "scale"))
+pred_gbm <- predict(mod_gbm, testing)
+print(paste("Accuracy:", (confusionMatrix(pred_gbm, testing$classe)$overall[1])))
+```
+
+## Linear Discriminant Analysis
+
+```{r}
+set.seed(seed)
+mod_lda <- train(classe ~ ., 
+                 data = training, 
+                 method = "lda", 
+                 trControl = ctl,
+                 preProc = c("center", "scale"))
+pred_lda <- predict(mod_lda, testing)
+print(paste("Accuracy:", (confusionMatrix(pred_lda, testing$classe)$overall[1])))
+```
+
+## Random Forests
+
+```{r}
+set.seed(seed)
+mod_rf <- randomForest(classe ~ ., data = training, ntree = nt) 
+pred_rf <- predict(mod_rf, testing)
+print(paste("Accuracy:", (confusionMatrix(pred_rf, testing$classe)$overall[1])))
+```
+
+## Decision Tree
+
+```{r}
+set.seed(seed)
+mod_rpart <- rpart(classe ~ ., data = training, method = "class", xval = cv)
+pred_rpart <- predict(object = mod_rpart, 
+              newdata = testing, 
+              type = "class") 
+print(paste("Accuracy:", (confusionMatrix(pred_rpart, testing$classe)$overall[1])))
+```
+
+## TreeBag
+
+```{r}
+mod_treebag <- train(classe ~ ., 
+                     data = training, 
+                     method = "treebag", 
+                     trControl = ctl,
+                     preProc = c("center", "scale"))
+pred_treebag <- predict(mod_treebag, testing)
+print(paste("Accuracy:", (confusionMatrix(pred_treebag, testing$classe)$overall[1])))
+```
+
+# Final Model
+
+The final model is a combined model that uses all five of the above methods as classifiers in the final prediction model.
+
+```{r}
+predDF <- data.frame(pred_gbm, 
+                     pred_lda,
+                     pred_rf,
+                     pred_rpart,
+                     pred_treebag,
+                     classe = testing$classe)
+
+set.seed(seed)
+combModFit <- randomForest(classe ~ ., data = predDF, ntree = nt)
+combPred <- predict(combModFit, predDF)
+print(paste("Accuracy:", (confusionMatrix(combPred, testing$classe)$overall[1])))
+combModFit
+```
+
+As shown above, the estimated out of sample error rate is 0.16% for the combined classifier model.
+
+# Predictions
+
+```{r}
+pred_gbm2 <- predict(mod_gbm, dat2)
+pred_lda2 <- predict(mod_lda, dat2)
+pred_rf2 <- predict(mod_rf, dat2)
+pred_rpart2 <- predict(object = mod_rpart, 
+                       newdata = dat2, 
+                       type = "class")
+pred_treebag2 <- predict(mod_treebag, dat2)
+
+predDF2 <- data.frame(pred_gbm = pred_gbm2, 
+                      pred_lda = pred_lda2,
+                      pred_rf = pred_rf2,
+                      pred_rpart = pred_rpart2,
+                      pred_treebag = pred_treebag2)
+
+combPred2 <- predict(combModFit, predDF2)
+print(combPred2)
+```
+
